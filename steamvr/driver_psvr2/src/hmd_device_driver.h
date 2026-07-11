@@ -20,7 +20,12 @@ struct Psvr2DisplayConfig
 	int32_t window_height = 2040;
 	int32_t render_width = 2000;   // per-eye render target
 	int32_t render_height = 2040;
-	float   fov_tan = 1.30f;       // tan(half-FOV); ~104deg total — refine from the PSVR2 RE notes
+
+	// Distortion calibration for psvr2_compute_distortion_asymmetric: per-eye
+	// X/Y offsets + tilt cos/sin (see psvr2_distortion.h). Defaults are the
+	// generic fallback; Psvr2ReadFactoryCalibration overwrites them with the
+	// per-unit values read from the headset.
+	float distortion_calibration[8] = { -0.09919293f, 0.0f, 0.09919293f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f };
 
 	// Direct mode (default): report the panel as a real, NON-desktop display so
 	// SteamVR's compositor acquires it directly via DRM leasing (no TTY, desktop
@@ -80,4 +85,7 @@ private:
 	std::atomic<uint32_t> device_index_{ vr::k_unTrackedDeviceIndexInvalid };
 	vr::DriverPose_t last_pose_{};
 	std::thread pose_thread_;
+
+	int ipd_fd_ = -1;      // headset IPD-dial input device
+	float last_ipd_ = 0.0f;
 };

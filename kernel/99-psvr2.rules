@@ -11,3 +11,6 @@ SUBSYSTEM=="misc", KERNEL=="psvr2-pose", MODE="0660", GROUP="input"
 SUBSYSTEM=="misc", KERNEL=="psvr2-gaze", MODE="0660", GROUP="input"
 # V4L2 camera node
 SUBSYSTEM=="video4linux", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0cde", TAG+="uaccess"
+# Whole-device usbfs node: the SteamVR driver reads factory calibration via an
+# ep0 vendor control transfer (report 0x8f) and needs to open the device.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0cde", TAG+="uaccess", GROUP="plugdev", MODE="0660"

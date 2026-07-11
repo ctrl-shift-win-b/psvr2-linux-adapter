@@ -2,9 +2,59 @@
 #include "hmd_device_driver.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstring>
 
+#include <dirent.h>
+#include <fcntl.h>
+#include <linux/input.h>
+#include <unistd.h>
+
+#include "calibration.h"
 #include "driverlog.h"
+#include "psvr2_distortion.h"
+
+// The kernel module reports the IPD dial as ABS_MISC (millimetres) on the
+// "PlayStation VR2 Headset Controls" input device. Returns an open fd or -1.
+static int OpenIpdInputDevice()
+{
+	DIR *dir = opendir( "/dev/input" );
+	if ( !dir )
+		return -1;
+	int fd = -1;
+	struct dirent *de;
+	while ( fd < 0 && ( de = readdir( dir ) ) )
+	{
+		if ( strncmp( de->d_name, "event", 5 ) != 0 )
+			continue;
+		char path[64];
+		snprintf( path, sizeof( path ), "/dev/input/%s", de->d_name );
+		const int f = open( path, O_RDONLY | O_NONBLOCK );
+		if ( f < 0 )
+			continue;
+		char name[128] = { 0 };
+		if ( ioctl( f, EVIOCGNAME( sizeof( name ) - 1 ), name ) >= 0 &&
+		     strstr( name, "PlayStation VR2 Headset" ) )
+			fd = f;
+		else
+			close( f );
+	}
+	closedir( dir );
+	return fd;
+}
+
+// Current dial value in metres, or <= 0 on failure.
+static float ReadIpdMeters( int fd )
+{
+	if ( fd < 0 )
+		return -1.0f;
+	struct input_absinfo abs {};
+	if ( ioctl( fd, EVIOCGABS( ABS_MISC ), &abs ) < 0 )
+		return -1.0f;
+	if ( abs.value < 50 || abs.value > 80 )
+		return -1.0f;
+	return abs.value * 1e-3f;
+}
 
 static const char *kSettingsSection = "driver_psvr2";
 
@@ -49,8 +99,54 @@ Psvr2HmdDriver::Psvr2HmdDriver()
 	cfg.direct_mode = ( dm_err == vr::VRSettingsError_None ) ? direct_mode : true;
 	direct_mode_ = cfg.direct_mode;
 
+	// Per-unit factory optics from the headset; falls back to generic values.
+	char calib_detail[256] = { 0 };
+	Psvr2ReadFactoryCalibration( cfg.distortion_calibration, calib_detail, sizeof( calib_detail ) );
+	DriverLog( "psvr2: %s", calib_detail );
+
 	display_ = std::make_unique<Psvr2DisplayComponent>( cfg );
 	pose_source_ = std::make_unique<PoseSource>();
+
+	// Fusion tuning (all times in milliseconds; 0/absent keeps built-in defaults).
+	const float slam_latency_ms = vr::VRSettings()->GetFloat( kSettingsSection, "slam_latency_ms" );
+	const float fusion_tau_ms = vr::VRSettings()->GetFloat( kSettingsSection, "fusion_tau_ms" );
+	if ( slam_latency_ms > 0.0f || fusion_tau_ms > 0.0f )
+		pose_source_->SetFusionParams( slam_latency_ms > 0.0f ? slam_latency_ms * 1e-3 : -1.0,
+		                               fusion_tau_ms > 0.0f ? fusion_tau_ms * 1e-3 : -1.0 );
+
+	// Accel bias (wire axes, m/s^2, from tools/accel-bias-cal.py) + position tau.
+	vr::EVRSettingsError berr = vr::VRSettingsError_None;
+	const float b0 = vr::VRSettings()->GetFloat( kSettingsSection, "accel_bias_0", &berr );
+	if ( berr == vr::VRSettingsError_None )
+	{
+		const float b1 = vr::VRSettings()->GetFloat( kSettingsSection, "accel_bias_1" );
+		const float b2 = vr::VRSettings()->GetFloat( kSettingsSection, "accel_bias_2" );
+		const float pos_tau_ms = vr::VRSettings()->GetFloat( kSettingsSection, "pos_tau_ms" );
+		pose_source_->SetAccelParams( b0, b1, b2, pos_tau_ms > 0.0f ? pos_tau_ms * 1e-3 : -1.0 );
+	}
+
+	// EXPERIMENTAL: accel dead-reckoned translation; false = smoothed SLAM only.
+	vr::EVRSettingsError aerr = vr::VRSettingsError_None;
+	const bool accel_fusion = vr::VRSettings()->GetBool( kSettingsSection, "accel_fusion", &aerr );
+	if ( aerr == vr::VRSettingsError_None )
+		pose_source_->SetAccelFusion( accel_fusion );
+
+	// Full accel matrix (row-major, 9 floats) from tools/accel-matrix-cal.py.
+	double amat[9];
+	bool have_mat = true;
+	for ( int i = 0; i < 9 && have_mat; i++ )
+	{
+		char key[16];
+		snprintf( key, sizeof( key ), "accel_mat_%d", i );
+		vr::EVRSettingsError merr = vr::VRSettingsError_None;
+		amat[i] = vr::VRSettings()->GetFloat( kSettingsSection, key, &merr );
+		have_mat = ( merr == vr::VRSettingsError_None );
+	}
+	if ( have_mat )
+	{
+		pose_source_->SetAccelMatrix( amat );
+		DriverLog( "psvr2: full accel matrix loaded from settings" );
+	}
 
 	if ( !pose_source_->HasPose() )
 		DriverLog( "psvr2: /dev/psvr2-pose not found — HMD will not track (is the module loaded?)" );
@@ -64,8 +160,16 @@ vr::EVRInitError Psvr2HmdDriver::Activate( uint32_t unObjectId )
 	vr::VRProperties()->SetStringProperty( c, vr::Prop_ModelNumber_String, model_number_.c_str() );
 	vr::VRProperties()->SetStringProperty( c, vr::Prop_ManufacturerName_String, "Sony" );
 
-	const float ipd = vr::VRSettings()->GetFloat( vr::k_pch_SteamVR_Section, vr::k_pch_SteamVR_IPD_Float );
+	// IPD: prefer the headset's physical dial; fall back to the SteamVR setting.
+	ipd_fd_ = OpenIpdInputDevice();
+	const float dial_ipd = ReadIpdMeters( ipd_fd_ );
+	const float ipd = ( dial_ipd > 0.0f )
+	                      ? dial_ipd
+	                      : vr::VRSettings()->GetFloat( vr::k_pch_SteamVR_Section, vr::k_pch_SteamVR_IPD_Float );
+	if ( dial_ipd > 0.0f )
+		DriverLog( "psvr2: IPD from headset dial: %.1f mm (live updates on)", dial_ipd * 1e3f );
 	vr::VRProperties()->SetFloatProperty( c, vr::Prop_UserIpdMeters_Float, ipd );
+	last_ipd_ = ipd;
 
 	// Required for the compositor to start.
 	vr::VRProperties()->SetFloatProperty( c, vr::Prop_DisplayFrequency_Float, display_frequency_ );
@@ -119,19 +223,45 @@ vr::DriverPose_t Psvr2HmdDriver::GetPose()
 
 void Psvr2HmdDriver::PoseThread()
 {
+	// With the IMU available, submit gyro-fused poses at ~500 Hz; otherwise
+	// fall back to pacing on the blocking SLAM read (~stream rate).
+	const bool fused = pose_source_->HasImu();
+	if ( fused )
+		DriverLog( "psvr2: IMU fusion active — gyro-integrated poses at ~500 Hz over the SLAM base" );
+
+	unsigned tick = 0;
 	while ( active_ )
 	{
+		// Live IPD-dial updates, ~1 Hz.
+		if ( ipd_fd_ >= 0 && ( ++tick % 512 ) == 0 &&
+		     device_index_ != vr::k_unTrackedDeviceIndexInvalid )
+		{
+			const float ipd = ReadIpdMeters( ipd_fd_ );
+			if ( ipd > 0.0f && std::fabs( ipd - last_ipd_ ) >= 0.0005f )
+			{
+				vr::VRProperties()->SetFloatProperty(
+				    vr::VRProperties()->TrackedDeviceToPropertyContainer( device_index_ ),
+				    vr::Prop_UserIpdMeters_Float, ipd );
+				DriverLog( "psvr2: IPD dial -> %.1f mm", ipd * 1e3f );
+				last_ipd_ = ipd;
+			}
+		}
+
 		vr::DriverPose_t pose{};
-		if ( pose_source_->ReadPose( pose ) )
+		const bool ok = fused ? pose_source_->GetFusedPose( pose )
+		                      : pose_source_->ReadPose( pose );
+		if ( ok )
 		{
 			last_pose_ = pose;
 			if ( device_index_ != vr::k_unTrackedDeviceIndexInvalid )
 				vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
 					device_index_, pose, sizeof( pose ) );
+			if ( fused )
+				std::this_thread::sleep_for( std::chrono::milliseconds( 2 ) );
 		}
 		else
 		{
-			// No node / timeout: don't spin hot.
+			// No node / no first sample yet / timeout: don't spin hot.
 			std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
 		}
 	}
@@ -175,21 +305,39 @@ void Psvr2DisplayComponent::GetEyeOutputViewport( vr::EVREye eEye, uint32_t *pnX
 
 void Psvr2DisplayComponent::GetProjectionRaw( vr::EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom )
 {
-	// Symmetric FOV placeholder. TODO: per-eye asymmetric values from the
-	// headset FOV params in the PSVR2 reverse-engineering notes (docs/references.md).
-	*pfLeft = -config_.fov_tan;
-	*pfRight = config_.fov_tan;
-	*pfTop = -config_.fov_tan;
-	*pfBottom = config_.fov_tan;
+	// Per-eye asymmetric frusta (Monado psvr2 branch: up/down 53deg,
+	// outward 61.5deg, inward 43.5deg), as half-angle tangents.
+	constexpr float kTanVert = 1.3270448f;    // tan(53deg)
+	constexpr float kTanOutward = 1.8418131f; // tan(61.5deg)
+	constexpr float kTanInward = 0.9489646f;  // tan(43.5deg)
+
+	*pfTop = -kTanVert;
+	*pfBottom = kTanVert;
+	if ( eEye == vr::Eye_Left )
+	{
+		*pfLeft = -kTanOutward;
+		*pfRight = kTanInward;
+	}
+	else
+	{
+		*pfLeft = -kTanInward;
+		*pfRight = kTanOutward;
+	}
 }
 
 vr::DistortionCoordinates_t Psvr2DisplayComponent::ComputeDistortion( vr::EVREye eEye, float fU, float fV )
 {
-	// Identity (no distortion mesh yet). The PSVR2 lenses need a real mesh; until
-	// then SteamVR renders undistorted. TODO: import a distortion model.
+	xrt_uv_triplet t{};
+	psvr2_compute_distortion_asymmetric( config_.distortion_calibration, &t,
+	                                     ( eEye == vr::Eye_Left ) ? 0 : 1, fU, fV );
+
 	vr::DistortionCoordinates_t c{};
-	c.rfRed[0] = c.rfGreen[0] = c.rfBlue[0] = fU;
-	c.rfRed[1] = c.rfGreen[1] = c.rfBlue[1] = fV;
+	c.rfRed[0] = t.r.x;
+	c.rfRed[1] = t.r.y;
+	c.rfGreen[0] = t.g.x;
+	c.rfGreen[1] = t.g.y;
+	c.rfBlue[0] = t.b.x;
+	c.rfBlue[1] = t.b.y;
 	return c;
 }
 

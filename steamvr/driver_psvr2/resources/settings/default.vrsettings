@@ -6,6 +6,25 @@
 
 		"display_frequency": 90.0,
 
+		"//fusion": "slam_latency_ms: age of a SLAM sample at arrival (camera+compute+USB);",
+		"//fusion2": "fusion_tau_ms: drift-correction blend time constant. Tune if rotation",
+		"//fusion3": "flutters (latency too low/high) or drifts visibly (tau too high).",
+		"slam_latency_ms": 20.0,
+		"fusion_tau_ms": 200.0,
+
+		"//accel": "Accelerometer bias in wire axes, m/s^2 — measure with",
+		"//accel2": "tools/accel-bias-cal.py (unit-specific). pos_tau_ms is the",
+		"//accel3": "position drift-correction time constant.",
+		"accel_bias_0": -0.0114,
+		"accel_bias_1": 0.0085,
+		"accel_bias_2": 0.3138,
+		"pos_tau_ms": 200.0,
+
+		"//accel4": "EXPERIMENTAL: accel dead-reckoned translation, using the",
+		"//accel5": "negated full gyro matrix (same-die IMU). false = smoothed-",
+		"//accel6": "SLAM translation (safe fallback).",
+		"accel_fusion": true,
+
 		"//direct": "true (default): report the panel as a real, non-desktop display",
 		"//direct2": "so SteamVR's compositor acquires it directly via DRM leasing (no",
 		"//direct3": "TTY; desktop keeps running). false: extended-desktop scaffold,",

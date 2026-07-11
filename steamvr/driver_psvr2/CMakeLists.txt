@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 cmake_minimum_required(VERSION 3.16)
-project(driver_psvr2 LANGUAGES CXX)
+project(driver_psvr2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,8 +18,16 @@ add_library(driver_psvr2 MODULE
     src/device_provider.cpp
     src/hmd_device_driver.cpp
     src/pose_source.cpp
+    src/calibration.cpp
+    src/psvr2_distortion.c
     "${OPENVR_DIR}/driverlog.cpp"
 )
+
+# Factory calibration readout (ep0 vendor control transfer).
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
+target_include_directories(driver_psvr2 PRIVATE ${LIBUSB_INCLUDE_DIRS})
+target_link_libraries(driver_psvr2 PRIVATE ${LIBUSB_LIBRARIES})
 
 target_include_directories(driver_psvr2 PRIVATE
     src
