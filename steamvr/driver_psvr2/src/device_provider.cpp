@@ -1,11 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "device_provider.h"
 
+#include <sys/stat.h>
+
 #include "driverlog.h"
+
+// True when PSVR2 hardware is actually present: the kernel module's pose node
+// exists (module loaded + headset enumerated). Without this check the driver
+// registers a dead HMD that blocks other headsets (e.g. Steam Link) from
+// claiming the HMD slot — unplugging the PSVR2 should mean it is gone.
+static bool Psvr2HardwarePresent()
+{
+	struct stat st {};
+	return stat( "/dev/psvr2-pose", &st ) == 0;
+}
 
 vr::EVRInitError Psvr2DeviceProvider::Init( vr::IVRDriverContext *pDriverContext )
 {
 	VR_INIT_SERVER_DRIVER_CONTEXT( pDriverContext );
+
+	if ( !Psvr2HardwarePresent() )
+	{
+		DriverLog( "psvr2: no headset detected (/dev/psvr2-pose absent) — driver idle" );
+		return vr::VRInitError_Init_HmdNotFound;
+	}
 
 	hmd_ = std::make_unique<Psvr2HmdDriver>();
 
